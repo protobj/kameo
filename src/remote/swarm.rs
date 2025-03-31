@@ -532,6 +532,10 @@ impl ActorSwarmHandler {
                         SwarmEvent::Behaviour(ActorSwarmBehaviourEvent::Mdns(event)) => {
                             self.handle_event(swarm, ActorSwarmEvent::Behaviour(ActorSwarmBehaviourEvent::Mdns(event)));
                         }
+                        SwarmEvent::Behaviour(ActorNodeSwarmBehaviourEvent::Gossipsub(
+                            gossipsub::Event::Message{propagation_source: peer_id,message_id: id,message})) => {
+                            tracing::info!("Gossipsub message received from {:?} message_id:{:?} message:{:?}", peer_id,id,message);
+                        }
                         _ => {},
                     }
                 }
@@ -1473,6 +1477,7 @@ pub trait SwarmBehaviour: NetworkBehaviour {
 
 #[allow(missing_docs)]
 mod behaviour {
+    use libp2p::gossipsub;
     use super::*;
 
     /// Network behaviour for the actor swarm.
@@ -1487,6 +1492,8 @@ mod behaviour {
         pub request_response: request_response::cbor::Behaviour<SwarmRequest, SwarmResponse>,
         /// Mdns for discovery.
         pub mdns: mdns::tokio::Behaviour,
+        /// gossipsub for actor node discovery
+        pub gossipsub: gossipsub::Behaviour,
     }
 }
 
@@ -1515,6 +1522,28 @@ pub enum ActorSwarmEvent {
 impl ActorSwarmBehaviour {
     /// Creates a new default actor behaviour with a keypair.
     pub fn new(keypair: &Keypair) -> io::Result<Self> {
+        // To content-address message, we can take the hash of message and use it as an ID.
+        let message_id_fn = |message: &gossipsub::Message| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            gossipsub::MessageId::from(s.finish().to_string())
+        };
+
+        // Set a custom gossipsub configuration
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
+            .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
+            // signing)
+            .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
+            .build()
+            .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
+
+        // build a gossipsub network behaviour
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+            gossipsub_config,
+        )
+            .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
         Ok(ActorSwarmBehaviour {
             kademlia: kad::Behaviour::new(
                 keypair.public().to_peer_id(),
@@ -1528,6 +1557,7 @@ impl ActorSwarmBehaviour {
                 [(StreamProtocol::new("/kameo/1"), ProtocolSupport::Full)],
                 request_response::Config::default(),
             ),
+            gossipsub,
         })
     }
 }
